@@ -1,10 +1,15 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { sendConversationMessage } from "../services/aimotive.client";
 import { redis } from "../lib/redis";
-import { generateReply } from "../services/ai.reply";
+import { sendConversationMessage } from "../services/aimotive.client";
+import {
+  describeImageFromUrl,
+  generateReply,
+  transcribeAudioFromUrl,
+  type ConversationMessage,
+} from "../services/ai.reply";
 
-const SkritInboundSchema = z.object({
+const InboundSchema = z.object({
   instance: z.string().uuid(),
   conversation: z.string().min(16).includes("@"),
   message: z.object({
@@ -17,34 +22,38 @@ const SkritInboundSchema = z.object({
     data: z.object({
       type: z.enum(["text", "audio", "image"]),
       body: z.string().optional(),
+      caption: z.string().optional(),
+      url: z.string().url().optional(),
+      mediaUrl: z.string().url().optional(),
+      fileUrl: z.string().url().optional(),
+      file_url: z.string().url().optional(),
     }),
   }),
 });
 
-type SessionMsg = {
-  role: "user" | "assistant";
-  content: string;
-  ts: number;
-};
+const OutboundEventSchema = z.object({
+  instance: z.string().uuid().optional(),
+  conversation: z.string().optional(),
+  event: z.string().optional(),
+  status: z.string().optional(),
+  message: z.unknown().optional(),
+});
 
-type Session = {
-  messages: SessionMsg[];
-};
+type SessionMsg = ConversationMessage & { ts: number };
+type Session = { messages: SessionMsg[] };
+
+const TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS) || 180;
+const MAX_MESSAGES = Number(process.env.SESSION_MAX_MESSAGES) || 12;
+const CONTEXT_WINDOW = Number(process.env.SESSION_CONTEXT_WINDOW) || 10;
 
 function sessionKey(instanceId: string, conversationId: string) {
   return `sess:${instanceId}:${conversationId}`;
 }
 
-const TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS) || 180; // 3 min
-const MAX_MESSAGES = Number(process.env.SESSION_MAX_MESSAGES) || 12;
-
-// --- helpers -------------------------------------------------------------
-
-// Caso n8n mutante: { "{...json...}": "" }  (JSON como KEY)
-function parseJsonKeyObject(obj: any): any | null {
+function parseJsonKeyObject(obj: unknown): unknown | null {
   if (!obj || typeof obj !== "object") return null;
-  const keys = Object.keys(obj);
-  const jsonKey = keys.find((k) => typeof k === "string" && k.trim().startsWith("{"));
+  const keys = Object.keys(obj as Record<string, unknown>);
+  const jsonKey = keys.find((k) => k.trim().startsWith("{"));
   if (!jsonKey) return null;
   try {
     return JSON.parse(jsonKey);
@@ -53,211 +62,179 @@ function parseJsonKeyObject(obj: any): any | null {
   }
 }
 
-// Intenta parsear string JSON sin tirar el server (incluye caso n8n: '={...}')
-function safeParseJsonString(s: unknown, app?: FastifyInstance): any | unknown {
+function safeParseJsonString(s: unknown, app?: FastifyInstance): unknown {
   if (typeof s !== "string") return s;
 
   let t = s.trim();
   if (!t) return s;
-
-  // n8n a veces manda '={...}' (ojo al '=')
   if (t.startsWith("=")) t = t.slice(1).trim();
-
-  // solo intentamos si tiene pinta de JSON
   if (!(t.startsWith("{") || t.startsWith("["))) return s;
 
   try {
     return JSON.parse(t);
   } catch (e) {
-    app?.log?.warn?.(
-      { err: e, sample: t.slice(0, 200) },
-      "String looked like JSON but failed to parse"
-    );
+    app?.log.warn({ err: e, sample: t.slice(0, 200) }, "Could not parse JSON-like string");
     return s;
   }
 }
 
-/**
- * Normaliza para soportar:
- * - payload objeto directo
- * - { body: "<json string>" }
- * - { body: { ...payload... } }
- * - form-urlencoded n8n: body: { "{...json...}": "" }
- * - n8n mutante: { "{...json...}": "" } (JSON como KEY)
- */
-function normalizeInboundPayload(raw: any, app?: FastifyInstance) {
+function normalizeInboundPayload(raw: unknown, app?: FastifyInstance): unknown {
   if (!raw) return raw;
 
-  // A) ya viene perfecto
-  if (raw.instance && raw.conversation && raw.message) return raw;
+  if (typeof raw === "object") {
+    const obj = raw as Record<string, unknown>;
+    if (obj.instance && obj.conversation && obj.message) return raw;
 
-  // B) n8n mutante en root
-  const rootParsed = parseJsonKeyObject(raw);
-  if (rootParsed) return rootParsed;
+    const rootParsed = parseJsonKeyObject(raw);
+    if (rootParsed) return rootParsed;
 
-  // C) si viene envuelto en raw.body
-  const candidate = raw.body ?? raw;
+    const candidate = obj.body ?? raw;
 
-  // C1) candidate es string -> intentar parsear
-  if (typeof candidate === "string") {
-    return safeParseJsonString(candidate, app);
-  }
+    if (typeof candidate === "string") return safeParseJsonString(candidate, app);
 
-  // C2) candidate es object
-  if (candidate && typeof candidate === "object") {
-    if (candidate.instance && candidate.conversation && candidate.message) return candidate;
+    if (candidate && typeof candidate === "object") {
+      const c = candidate as Record<string, unknown>;
+      if (c.instance && c.conversation && c.message) return candidate;
 
-    // C2a) n8n mutante dentro de body
-    const insideParsed = parseJsonKeyObject(candidate);
-    if (insideParsed) return insideParsed;
+      const insideParsed = parseJsonKeyObject(candidate);
+      if (insideParsed) return insideParsed;
 
-    // C2b) doble wrapper { body: { body: "..." } } / { body: "..." }
-    if (candidate.body !== undefined) {
-      return normalizeInboundPayload(candidate, app);
+      if (c.body !== undefined) return normalizeInboundPayload(candidate, app);
+
+      return candidate;
     }
 
     return candidate;
   }
 
-  return candidate;
+  return raw;
 }
 
-// Provider outbound: recorta sufijo ':NN' antes de '@' para cumplir límite
 function normalizeConversationIdForOutbound(conversationId: string) {
   return conversationId.replace(/:\d+(?=@)/, "");
 }
 
-// --- route ---------------------------------------------------------------
+function extractMediaUrl(data: z.infer<typeof InboundSchema>["message"]["data"]) {
+  return data.mediaUrl || data.url || data.fileUrl || data.file_url;
+}
+
+async function loadSession(key: string, app: FastifyInstance): Promise<Session> {
+  try {
+    const raw = await redis.get(key);
+    if (!raw) return { messages: [] };
+    return JSON.parse(raw) as Session;
+  } catch (e) {
+    app.log.error({ err: e }, "Redis get/parse failed");
+    return { messages: [] };
+  }
+}
+
+async function saveSession(key: string, session: Session, app: FastifyInstance) {
+  try {
+    await redis.set(key, JSON.stringify(session), { EX: TTL_SECONDS });
+    app.log.info({ key, ttl: TTL_SECONDS, size: session.messages.length }, "Session saved");
+  } catch (e) {
+    app.log.error({ err: e }, "Redis set failed");
+  }
+}
 
 export async function webhook(app: FastifyInstance) {
   app.post("/webhook/aimotive/inbound", async (req, reply) => {
-    const ct = req.headers["content-type"];
-
     const normalized = normalizeInboundPayload(req.body, app);
-
-    // Si aún queda string JSON, intentar parsear otra vez
     const finalPayload = safeParseJsonString(normalized, app);
 
-    app.log.info(
-      {
-        ct,
-        rawType: typeof req.body,
-        normalizedType: typeof normalized,
-        finalType: typeof finalPayload,
-        normalizedPreview:
-          typeof normalized === "string" ? normalized.slice(0, 200) : normalized,
-        finalPreview:
-          typeof finalPayload === "string" ? finalPayload.slice(0, 200) : finalPayload,
-      },
-      "Inbound received"
-    );
-
-    const parsed = SkritInboundSchema.safeParse(finalPayload);
-
+    const parsed = InboundSchema.safeParse(finalPayload);
     if (!parsed.success) {
-      app.log.warn(
-        { ct, errors: parsed.error.format(), raw: req.body, normalized, finalPayload },
-        "Invalid inbound payload"
-      );
+      app.log.warn({ errors: parsed.error.format(), raw: req.body }, "Invalid inbound payload");
       return reply.code(200).send({ ok: true, ignored: true });
     }
 
     const inbound = parsed.data;
 
-    // Anti-loop
     if (inbound.message.from.isMine === true) {
-      app.log.info(
-        { instanceId: inbound.instance, conversationId: inbound.conversation },
-        "Ignored isMine message"
-      );
       return reply.code(200).send({ ok: true, ignored: true });
     }
 
     const instanceId = inbound.instance;
     const conversationId = inbound.conversation;
-
-    const incomingText =
-      inbound.message.data.type === "text" ? inbound.message.data.body ?? "" : "";
+    const messageType = inbound.message.data.type;
 
     const key = sessionKey(instanceId, conversationId);
+    const session = await loadSession(key, app);
 
-    // 1) Cargar sesión
-    let session: Session = { messages: [] };
-    try {
-      const rawSession = await redis.get(key);
-      if (rawSession) session = JSON.parse(rawSession) as Session;
-    } catch (e) {
-      app.log.error({ err: e }, "Redis get/parse failed (continuing without session)");
-      session = { messages: [] };
+    let normalizedUserContent = "";
+
+    if (messageType === "text") {
+      normalizedUserContent = (inbound.message.data.body || "").trim();
     }
 
-    // 2) Añadir mensaje del usuario a la sesión
-    session.messages.push({
-      role: "user",
-      content: incomingText || `[${inbound.message.data.type}]`,
-      ts: Date.now(),
-    });
+    if (messageType === "audio") {
+      const mediaUrl = extractMediaUrl(inbound.message.data);
+      if (!mediaUrl) {
+        normalizedUserContent = "[audio sin URL disponible para transcripción]";
+      } else {
+        try {
+          const transcript = await transcribeAudioFromUrl(mediaUrl);
+          normalizedUserContent = transcript || "[audio recibido pero sin texto transcrito]";
+        } catch (e) {
+          app.log.error({ err: e, conversationId }, "Audio transcription failed");
+          normalizedUserContent = "[audio recibido pero falló la transcripción]";
+        }
+      }
+    }
 
+    if (messageType === "image") {
+      const mediaUrl = extractMediaUrl(inbound.message.data);
+      if (!mediaUrl) {
+        normalizedUserContent = "[imagen sin URL disponible para análisis]";
+      } else {
+        try {
+          const description = await describeImageFromUrl(mediaUrl);
+          const caption = inbound.message.data.caption ? `\nCaption: ${inbound.message.data.caption}` : "";
+          normalizedUserContent = `Imagen analizada:${caption}\n${description}`;
+        } catch (e) {
+          app.log.error({ err: e, conversationId }, "Image analysis failed");
+          normalizedUserContent = "[imagen recibida pero falló el análisis visual]";
+        }
+      }
+    }
+
+    if (!normalizedUserContent) {
+      normalizedUserContent = `[${messageType}]`;
+    }
+
+    session.messages.push({ role: "user", content: normalizedUserContent, ts: Date.now() });
     session.messages = session.messages.slice(-MAX_MESSAGES);
 
-  // 3) Respuesta con IA
     let responseText = "";
-
     try {
-      // Pasamos SOLO texto a la IA (últimos N mensajes)
-      const context = session.messages
-        .slice(-8) // ajustable
-        .map((m) => m.content);
+      const context = session.messages.slice(-CONTEXT_WINDOW).map((m) => ({
+        role: m.role,
+        content: m.content,
+      }));
 
       responseText = await generateReply(context);
-
-      if (!responseText) {
-        responseText = "🤖 Me quedé en blanco… ¿me lo repites?";
-      }
+      if (!responseText) responseText = "🤖 Me quedé en blanco… ¿me lo repites?";
     } catch (e) {
       app.log.error({ err: e }, "AI generation failed");
       responseText = "🤖 Tuve un problema pensando eso… intenta otra vez.";
     }
 
-    // 4) Añadir respuesta a la sesión
-    session.messages.push({
-      role: "assistant",
-      content: responseText,
-      ts: Date.now(),
-    });
+    session.messages.push({ role: "assistant", content: responseText, ts: Date.now() });
     session.messages = session.messages.slice(-MAX_MESSAGES);
 
-    // 5) Guardar sesión con TTL
-    try {
-      await redis.set(key, JSON.stringify(session), { EX: TTL_SECONDS });
-      app.log.info({ key, ttl: TTL_SECONDS, size: session.messages.length }, "Session saved to Redis");
-    } catch (e) {
-      app.log.error({ err: e }, "Redis set failed (continuing)");
-    }
+    await saveSession(key, session, app);
 
-    // 6) Enviar a WhatsApp (normalizando conversationId)
     const outboundConversationId = normalizeConversationIdForOutbound(conversationId);
-
     try {
-      const res = await sendConversationMessage(instanceId, outboundConversationId, responseText);
-
-      app.log.info(
-        {
-          instanceId,
-          conversationId,
-          outboundConversationId,
-          sid: res?.sid,
-          responseText,
-        },
-        "Outbound message sent"
-      );
+      await sendConversationMessage(instanceId, outboundConversationId, responseText);
+      app.log.info({ instanceId, conversationId, outboundConversationId }, "Outbound message sent");
     } catch (err: any) {
       app.log.error(
         {
           instanceId,
           conversationId,
           outboundConversationId,
-          responseText,
           status: err?.response?.status,
           data: err?.response?.data,
           message: err?.message,
@@ -266,6 +243,20 @@ export async function webhook(app: FastifyInstance) {
       );
     }
 
+    return reply.code(200).send({ ok: true });
+  });
+
+  app.post("/webhook/aimotive/outbound", async (req, reply) => {
+    const normalized = normalizeInboundPayload(req.body, app);
+    const finalPayload = safeParseJsonString(normalized, app);
+
+    const parsed = OutboundEventSchema.safeParse(finalPayload);
+    if (!parsed.success) {
+      app.log.warn({ errors: parsed.error.format(), raw: req.body }, "Invalid outbound webhook payload");
+      return reply.code(200).send({ ok: true, ignored: true });
+    }
+
+    app.log.info({ outboundEvent: parsed.data }, "Outbound webhook event received");
     return reply.code(200).send({ ok: true });
   });
 }
