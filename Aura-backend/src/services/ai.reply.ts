@@ -21,17 +21,27 @@ const SYSTEM_PROMPT = [
   "No inventes datos.",
 ].join(" ");
 
+// ---------------- utils ----------------
+
+function normalizeContentType(ct?: string) {
+  if (!ct) return "";
+  return ct.toLowerCase().split(";")[0].trim(); // <- quita "; codecs=opus"
+}
+
 function extensionFromContentType(contentType?: string) {
-  if (!contentType) return "";
-  const normalized = contentType.toLowerCase();
-  if (normalized.includes("jpeg")) return ".jpg";
-  if (normalized.includes("png")) return ".png";
-  if (normalized.includes("webp")) return ".webp";
-  if (normalized.includes("gif")) return ".gif";
-  if (normalized.includes("mp3") || normalized.includes("mpeg")) return ".mp3";
-  if (normalized.includes("wav")) return ".wav";
-  if (normalized.includes("ogg")) return ".ogg";
-  if (normalized.includes("m4a") || normalized.includes("mp4")) return ".m4a";
+  const ct = normalizeContentType(contentType);
+  if (!ct) return "";
+
+  if (ct === "image/jpeg" || ct === "image/jpg") return ".jpg";
+  if (ct === "image/png") return ".png";
+  if (ct === "image/webp") return ".webp";
+  if (ct === "image/gif") return ".gif";
+
+  if (ct === "audio/mpeg" || ct === "audio/mp3") return ".mp3";
+  if (ct === "audio/wav") return ".wav";
+  if (ct === "audio/ogg" || ct === "application/ogg") return ".ogg";
+  if (ct === "audio/mp4" || ct === "audio/m4a" || ct === "video/mp4") return ".m4a";
+
   return "";
 }
 
@@ -45,32 +55,46 @@ function extensionFromUrl(url: string) {
   }
 }
 
+/**
+ * Descarga robusta para CDN firmado.
+ * - añade User-Agent / Accept
+ * - aguanta query enorme
+ * - timeout razonable
+ */
 async function downloadToTempFile(url: string, prefix: "audio" | "image") {
   const resp = await axios.get<ArrayBuffer>(url, {
     responseType: "arraybuffer",
-    timeout: 30000,
+    timeout: 45000,
     maxContentLength: 40 * 1024 * 1024,
+    // algunos CDNs se ponen tiquismiquis si no pareces "navegador"
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; AimotiveBot/1.0)",
+      Accept: "*/*",
+    },
+    // por si axios intenta cosas raras con proxies/redirects:
+    maxRedirects: 5,
+    validateStatus: (s) => s >= 200 && s < 300,
   });
 
+  const contentType = String(resp.headers["content-type"] || "application/octet-stream");
   const ext =
-    extensionFromContentType(String(resp.headers["content-type"] || "")) || extensionFromUrl(url) || ".bin";
-  const tempPath = join(tmpdir(), `aura-${prefix}-${randomUUID()}${ext}`);
+    extensionFromContentType(contentType) || extensionFromUrl(url) || (prefix === "image" ? ".jpg" : ".bin");
 
+  const tempPath = join(tmpdir(), `aura-${prefix}-${randomUUID()}${ext}`);
   await fs.writeFile(tempPath, Buffer.from(resp.data));
 
   return {
     path: tempPath,
-    mimeType: String(resp.headers["content-type"] || "application/octet-stream"),
+    mimeType: contentType,
   };
 }
+
+// ---------------- OpenAI calls ----------------
 
 export async function generateReply(messages: ConversationMessage[]) {
   const input = [
     { role: "system" as const, content: SYSTEM_PROMPT },
-    ...messages.map((m) => ({
-      role: m.role,
-      content: m.content,
-    })),
+    ...messages.map((m) => ({ role: m.role, content: m.content })),
   ];
 
   const resp = await openai.responses.create({
@@ -103,7 +127,7 @@ export async function describeImageFromUrl(imageUrl: string) {
 
   try {
     const bytes = await fs.readFile(path);
-    const dataUrl = `data:${mimeType};base64,${bytes.toString("base64")}`;
+    const dataUrl = `data:${normalizeContentType(mimeType) || "image/jpeg"};base64,${bytes.toString("base64")}`;
 
     const prompt = [
       "Mira la imagen y descríbela con mucho detalle en español.",
