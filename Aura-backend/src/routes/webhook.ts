@@ -184,9 +184,53 @@ function inferType(opts: { type?: string; mime?: string; url?: string; body?: st
   const body = (opts.body || "").trim();
 
   if (t === "image" || mime.startsWith("image/") || url.includes("/imagemessage/")) return "image";
-  if (t === "audio" || mime.startsWith("audio/") || url.includes("/audiomessage/")) return "audio";
+  if (
+    t === "audio" ||
+    t === "ptt" ||
+    t === "voice" ||
+    mime.startsWith("audio/") ||
+    mime.includes("opus") ||
+    url.includes("/audiomessage/") ||
+    url.includes("/pttmessage/") ||
+    url.includes("/voicemessage/")
+  )
+    return "audio";
   if (t === "text" || body) return "text";
   return "text";
+}
+
+function asString(v: unknown) {
+  return typeof v === "string" && v.trim() ? v : undefined;
+}
+
+function extractMediaUrlFromData(data: Record<string, unknown>): string | undefined {
+  const directCandidates = [
+    data.mediaUrl,
+    data.url,
+    data.fileUrl,
+    data.file_url,
+    data.audioUrl,
+    data.imageUrl,
+  ];
+
+  for (const candidate of directCandidates) {
+    const s = asString(candidate);
+    if (s) return s;
+  }
+
+  const nestedCandidates = [
+    (data.media as Record<string, unknown> | undefined)?.url,
+    (data.audio as Record<string, unknown> | undefined)?.url,
+    (data.image as Record<string, unknown> | undefined)?.url,
+    (data.file as Record<string, unknown> | undefined)?.url,
+  ];
+
+  for (const candidate of nestedCandidates) {
+    const s = asString(candidate);
+    if (s) return s;
+  }
+
+  return undefined;
 }
 
 function normalizeSkritInbound(anyPayload: unknown): NormalizedInbound | null {
@@ -200,8 +244,7 @@ function normalizeSkritInbound(anyPayload: unknown): NormalizedInbound | null {
     const data = o.message?.data;
 
     if (instance && conversation && data) {
-      const mediaUrl =
-        data.mediaUrl || data.url || data.fileUrl || data.file_url;
+      const mediaUrl = extractMediaUrlFromData(data);
 
       const type = inferType({
         type: data.type,
@@ -253,6 +296,7 @@ function normalizeSkritInbound(anyPayload: unknown): NormalizedInbound | null {
 
     // url base
     let baseUrl =
+      grab(/"mediaUrl"\s*:\s*"(https?:\/\/[^"\\]+)"/) ||
       grab(/"url"\s*:\s*"(https?:\/\/[^"]+?)\?X-Amz-Algorithm"/) ||
       grab(/"url"\s*:\s*"(https?:\/\/[^"]+?\.(?:jpe?g|png|webp|gif|oga|ogg|opus|mp3|wav|m4a))"/) ||
       grab(/(https?:\/\/cdn\.evo\.skrit\.es[^\s"']+\.(?:jpe?g|png|webp|gif|oga|ogg|opus|mp3|wav|m4a))/);
