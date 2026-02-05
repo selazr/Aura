@@ -58,10 +58,46 @@ function parseJsonKeyObject(obj: unknown): unknown | null {
   try {
     return JSON.parse(jsonKey);
   } catch {
-    return null;
+    return parseMalformedJsonKeyPayload(jsonKey);
   }
 }
 
+
+function parseMalformedJsonKeyPayload(raw: string): unknown | null {
+  const instance = raw.match(/"instance":"([^"]+)"/)?.[1];
+  const conversation = raw.match(/"conversation":"([^"]+)"/)?.[1];
+  const messageId = raw.match(/"message":\{"id":"([^"]+)"/)?.[1] ?? raw.match(/"id":"([^"]+)"/)?.[1];
+  const fromId = raw.match(/"from":\{"id":"([^"]+)"/)?.[1] ?? "unknown";
+  const type = raw.match(/"type":"(text|audio|image)"/)?.[1] as "text" | "audio" | "image" | undefined;
+
+  if (!instance || !conversation || !messageId || !type) return null;
+
+  const date = raw.match(/"date":"([^"]+)"/)?.[1];
+  const body = raw.match(/"body":"([^"]*)"/)?.[1];
+  const caption = raw.match(/"caption":"([^"]*)"/)?.[1];
+  const url = raw.match(/"url":"(https?:\/\/[^"\s]+)"/)?.[1];
+  const isMineMatch = raw.match(/"isMine":(true|false)/)?.[1];
+  const isMine = isMineMatch === undefined ? undefined : isMineMatch === "true";
+
+  return {
+    instance,
+    conversation,
+    message: {
+      id: messageId,
+      ...(date ? { date } : {}),
+      from: {
+        id: fromId,
+        ...(typeof isMine === "boolean" ? { isMine } : {}),
+      },
+      data: {
+        type,
+        ...(body ? { body } : {}),
+        ...(caption ? { caption } : {}),
+        ...(url ? { url } : {}),
+      },
+    },
+  };
+}
 function safeParseJsonString(s: unknown, app?: FastifyInstance): unknown {
   if (typeof s !== "string") return s;
 
