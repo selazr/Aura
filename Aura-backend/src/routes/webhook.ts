@@ -30,11 +30,24 @@ const MAX_MESSAGES = Number(process.env.SESSION_MAX_MESSAGES) || 12;
 const CONTEXT_WINDOW = Number(process.env.SESSION_CONTEXT_WINDOW) || 10;
 
 function sessionKey(instanceId: string, conversationId: string) {
-  return `sess:${instanceId}:${conversationId}`;
+  return `sess:${instanceId}:${normalizeConversationIdForOutbound(conversationId)}`;
 }
 
 function normalizeConversationIdForOutbound(conversationId: string) {
   return conversationId.replace(/:\d+(?=@)/, "");
+}
+
+function buildUserMessageByType(inbound: z.infer<typeof NormalizedInboundSchema>) {
+  if (inbound.type === "text") {
+    const text = (inbound.text || "").trim();
+    return text ? `[texto] ${text}` : "[texto] [vacío]";
+  }
+
+  if (inbound.type === "audio") {
+    return "[audio]";
+  }
+
+  return "[imagen]";
 }
 
 // -------------------- Utils --------------------
@@ -362,40 +375,42 @@ export async function webhook(app: FastifyInstance) {
     const session = await loadSession(key, app);
 
     // user content
-    let normalizedUserContent = "";
+    let normalizedUserContent = buildUserMessageByType(inbound);
 
     if (inbound.type === "text") {
-      normalizedUserContent = (inbound.text || "").trim() || "[texto vacío]";
+      normalizedUserContent = buildUserMessageByType(inbound);
     }
 
     if (inbound.type === "audio") {
       if (!inbound.mediaUrl) {
-        normalizedUserContent = "[audio sin URL disponible para transcripción]";
-      } else {
-        try {
-          const transcript = await transcribeAudioFromUrl(inbound.mediaUrl);
-          normalizedUserContent = transcript || "[audio recibido pero sin texto transcrito]";
-        } catch (e) {
-          app.log.error({ err: e, mediaUrl: inbound.mediaUrl }, "Audio transcription failed");
-          normalizedUserContent = "[audio recibido pero falló la transcripción]";
+          normalizedUserContent = "[audio] [sin URL disponible para transcripción]";
+        } else {
+          try {
+            const transcript = await transcribeAudioFromUrl(inbound.mediaUrl);
+            normalizedUserContent = transcript
+              ? `[audio transcrito] ${transcript}`
+              : "[audio] [recibido pero sin texto transcrito]";
+          } catch (e) {
+            app.log.error({ err: e, mediaUrl: inbound.mediaUrl }, "Audio transcription failed");
+            normalizedUserContent = "[audio] [recibido pero falló la transcripción]";
+          }
         }
       }
-    }
 
     if (inbound.type === "image") {
       if (!inbound.mediaUrl) {
-        normalizedUserContent = "[imagen sin URL disponible para análisis]";
-      } else {
-        try {
-          const description = await describeImageFromUrl(inbound.mediaUrl);
-          const caption = inbound.caption ? `\nCaption: ${inbound.caption}` : "";
-          normalizedUserContent = `Imagen analizada:${caption}\n${description}`;
-        } catch (e) {
-          app.log.error({ err: e, mediaUrl: inbound.mediaUrl }, "Image analysis failed");
-          normalizedUserContent = "[imagen recibida pero falló el análisis visual]";
+          normalizedUserContent = "[imagen] [sin URL disponible para análisis]";
+        } else {
+          try {
+            const description = await describeImageFromUrl(inbound.mediaUrl);
+            const caption = inbound.caption ? `\nCaption: ${inbound.caption}` : "";
+            normalizedUserContent = `Imagen analizada:${caption}\n${description}`;
+          } catch (e) {
+            app.log.error({ err: e, mediaUrl: inbound.mediaUrl }, "Image analysis failed");
+            normalizedUserContent = "[imagen] [recibida pero falló el análisis visual]";
+          }
         }
       }
-    }
 
     session.messages.push({ role: "user", content: normalizedUserContent, ts: Date.now() });
     session.messages = session.messages.slice(-MAX_MESSAGES);
