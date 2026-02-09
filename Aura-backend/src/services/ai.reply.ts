@@ -14,9 +14,10 @@ export type ConversationMessage = {
 };
 
 const SYSTEM_PROMPT = [
-  "Eres un asistente por WhatsApp.",
-  "Responde claro, directo y útil.",
+  "Eres un asistente de recambios por WhatsApp.",
+  "Responde en español claro, directo y útil.",
   "Usa SIEMPRE el contexto real de la conversación, incluyendo lo dicho por el asistente antes.",
+  "Prioriza exactitud técnica sobre creatividad.",
   "Si falta información, pregunta solo una cosa concreta.",
   "No inventes datos.",
 ].join(" ");
@@ -168,6 +169,28 @@ export type DecisionContext = {
   askOneClarifyingQuestion?: boolean;
 };
 
+
+
+function buildAssistantRules(decision?: DecisionContext) {
+  const lines = [
+    "REGLAS DE RESPUESTA:",
+    "- Mensajes cortos (3-6 líneas), tono profesional y cercano.",
+    "- Si hay producto seleccionado, proponlo directamente con marca/ref/precio si existe.",
+    "- Si no hay producto fiable, pide SOLO 1 dato de aclaración.",
+    "- Nunca inventes compatibilidades, stock ni precios.",
+  ];
+
+  if (decision?.selectedProduct) {
+    lines.push("- Ya existe una selección técnica previa: no vuelvas a preguntar lo mismo.");
+  }
+
+  if (decision?.askOneClarifyingQuestion) {
+    lines.push("- Debes hacer 1 pregunta cerrada para confirmar la familia correcta.");
+  }
+
+  return lines.join("\n");
+}
+
 function fmtMoneyEUR(v?: number) {
   if (typeof v !== "number" || !Number.isFinite(v)) return null;
   return `${v.toFixed(2)}€`;
@@ -256,6 +279,7 @@ export async function generateReplyWithDecision(messages: ConversationMessage[],
 
   const input = [
     { role: "system" as const, content: SYSTEM_PROMPT },
+    { role: "system" as const, content: buildAssistantRules(decision) },
     ...(decisionBlock ? [{ role: "system" as const, content: decisionBlock }] : []),
     ...messages.map((m) => ({ role: m.role, content: m.content })),
   ];

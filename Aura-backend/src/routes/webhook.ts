@@ -70,6 +70,18 @@ type Session = {
   productAlternatives?: ProductAlt[];
 };
 
+type ProductSelectionData = {
+  selectedProduct: SelectedProduct | null;
+  alternatives: ProductAlt[];
+  meta: {
+    vehicleId: number | null;
+    familyId: number | null;
+    bestScore: number | null;
+    fetchedProducts: number;
+    primaryProducts: number;
+  };
+};
+
 const TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS) || 180;
 const MAX_MESSAGES = Number(process.env.SESSION_MAX_MESSAGES) || 12;
 const CONTEXT_WINDOW = Number(process.env.SESSION_CONTEXT_WINDOW) || 10;
@@ -136,6 +148,148 @@ async function saveSession(key: string, session: Session, app: FastifyInstance) 
   } catch (e) {
     app.log.error({ err: e }, "Redis set failed");
   }
+}
+
+function extractVehicleId(vehicle?: VehicleCache) {
+  return (
+    vehicle?.vehicleId ?? vehicle?.vehicles?.[0]?.id ?? vehicle?.vehicles?.[0]?.vehicleId ?? null
+  );
+}
+
+async function runEmbeddingMatch(userContent: string, app: FastifyInstance) {
+  try {
+    const matches = await matchCanonicalByEmbedding(userContent, MATCH_TOPK);
+    app.log.info({ top: matches?.[0], count: matches?.length || 0 }, "Catalog embedding matches computed");
+    return matches;
+  } catch (e: any) {
+    app.log.error({ err: e?.message || e, stack: e?.stack }, "Catalog embedding match failed");
+    return [] as PartMatch[];
+  }
+}
+
+async function selectProductForSession(session: Session, userContent: string, app: FastifyInstance): Promise<ProductSelectionData> {
+  const best = session.partMatches?.matches?.[0] ?? null;
+  const vehicleId = extractVehicleId(session.vehicle);
+  const familyId = best?.id ?? null;
+
+  if (!vehicleId || !familyId || !best) {
+    app.log.info({ vehicleId, familyId }, "Products selection skipped (missing vehicleId/familyId)");
+    return {
+      selectedProduct: null,
+      alternatives: [],
+      meta: {
+        vehicleId: vehicleId ? Number(vehicleId) : null,
+        familyId,
+        bestScore: best?.score ?? null,
+        fetchedProducts: 0,
+        primaryProducts: 0,
+      },
+    };
+  }
+
+  try {
+    const products = await getProductsByVehicle({
+      vehicleId: Number(vehicleId),
+      familyId: Number(familyId),
+    });
+
+    const { primary } = normalizeByFamily(Number(familyId), products, userContent);
+    const pickBase = primary.length ? primary : products;
+    const { selectedPart, partsSorted } = selectWinner(pickBase);
+
+    const selectedProduct = (selectedPart as any) ?? null;
+    const alternatives = (partsSorted as any[])
+      .filter((p) =>
+        selectedPart ? p.ref !== (selectedPart as any).ref || p.brandCode !== (selectedPart as any).brandCode : true
+      )
+      .slice(0, 4) as ProductAlt[];
+
+    const winner = selectedPart
+      ? {
+          ref: (selectedPart as any).ref,
+          name: (selectedPart as any).name,
+          brand: (selectedPart as any).brandName || (selectedPart as any).brandCode,
+          price: (selectedPart as any).price,
+          avail: (selectedPart as any).isAvailable,
+          stockTop: Array.isArray((selectedPart as any).warehouses)
+            ? (selectedPart as any).warehouses
+                .slice()
+                .sort((a: any, b: any) => Number(b.stock || 0) - Number(a.stock || 0))
+                .slice(0, 3)
+                .map((w: any) => `${w.name || w.code}:${Number(w.stock || 0)}`)
+                .join(" | ")
+            : null,
+        }
+      : null;
+
+    const topAlternatives = alternatives.slice(0, 3).map((a: any) => ({
+      ref: a.ref,
+      brand: a.brandName || a.brandCode,
+      price: a.price,
+      avail: a.isAvailable,
+    }));
+
+    app.log.info(
+      {
+        vehicleId,
+        familyId,
+        bestScore: best.score,
+        got: products.length,
+        primary: primary.length,
+        winner,
+        alts: topAlternatives,
+      },
+      "Products selected (decision cached)"
+    );
+
+    return {
+      selectedProduct,
+      alternatives,
+      meta: {
+        vehicleId: Number(vehicleId),
+        familyId: Number(familyId),
+        bestScore: best.score,
+        fetchedProducts: products.length,
+        primaryProducts: primary.length,
+      },
+    };
+  } catch (e: any) {
+    app.log.error({ err: e?.message || e, stack: e?.stack }, "Products selection failed");
+    return {
+      selectedProduct: null,
+      alternatives: [],
+      meta: {
+        vehicleId: Number(vehicleId),
+        familyId: Number(familyId),
+        bestScore: best.score,
+        fetchedProducts: 0,
+        primaryProducts: 0,
+      },
+    };
+  }
+}
+
+function buildDecisionContext(session: Session): DecisionContext {
+  const best = session.partMatches?.matches?.[0];
+  const hasSelected = Boolean(session.selectedProduct);
+
+  return {
+    part: best ? { id: best.id, canonical_name: best.canonical_name, score: best.score } : undefined,
+    vehicle: session.vehicle
+      ? {
+          plate: session.vehicle.plate,
+          brand: session.vehicle.brand,
+          model: session.vehicle.model,
+          fuel: session.vehicle.fuel,
+          vin: session.vehicle.vin,
+        }
+      : undefined,
+
+    selectedProduct: session.selectedProduct ?? undefined,
+    alternatives: session.productAlternatives?.length ? session.productAlternatives : undefined,
+
+    askOneClarifyingQuestion: !hasSelected && Boolean(best && best.score < MATCH_THRESHOLD),
+  };
 }
 
 // -------------------- Normalizer (n8n-style) --------------------
@@ -364,95 +518,18 @@ export async function webhook(app: FastifyInstance) {
     await maybeCacheVehicleFromText({ text: userContent, session, log: app.log });
 
     // 2) embeddings catálogo
-    try {
-      const matches = await matchCanonicalByEmbedding(userContent, MATCH_TOPK);
-      session.partMatches = {
-        matches,
-        _cachedAt: Date.now(),
-        source: "embedding",
-        textSample: userContent.slice(0, 200),
-      };
-      app.log.info({ top: matches?.[0], count: matches?.length || 0 }, "Catalog embedding matches computed");
-    } catch (e: any) {
-      app.log.error({ err: e?.message || e, stack: e?.stack }, "Catalog embedding match failed");
-    }
+    const matches = await runEmbeddingMatch(userContent, app);
+    session.partMatches = {
+      matches,
+      _cachedAt: Date.now(),
+      source: "embedding",
+      textSample: userContent.slice(0, 200),
+    };
 
     // 2.5) products/by-vehicle + normalize + winner
-    try {
-      const best = session.partMatches?.matches?.[0] ?? null;
-
-      const vehicleId =
-        session.vehicle?.vehicleId ??
-        session.vehicle?.vehicles?.[0]?.id ??
-        session.vehicle?.vehicles?.[0]?.vehicleId ??
-        null;
-
-      const familyId = best?.id ?? null;
-
-      if (vehicleId && familyId && best) {
-        const products = await getProductsByVehicle({
-          vehicleId: Number(vehicleId),
-          familyId: Number(familyId),
-        });
-
-        const { primary } = normalizeByFamily(Number(familyId), products, userContent);
-
-        const pickBase = primary.length ? primary : products;
-        const { selectedPart, partsSorted } = selectWinner(pickBase);
-
-        session.selectedProduct = (selectedPart as any) ?? null;
-        session.productAlternatives = (partsSorted as any[])
-          .filter((p) => (selectedPart ? p.ref !== (selectedPart as any).ref || p.brandCode !== (selectedPart as any).brandCode : true))
-          .slice(0, 4);
-
-        // ✅ LOG EXTRA (ganador + 3 alts)
-        const winner = selectedPart
-          ? {
-              ref: (selectedPart as any).ref,
-              name: (selectedPart as any).name,
-              brand: (selectedPart as any).brandName || (selectedPart as any).brandCode,
-              price: (selectedPart as any).price,
-              avail: (selectedPart as any).isAvailable,
-              stockTop: Array.isArray((selectedPart as any).warehouses)
-                ? (selectedPart as any).warehouses
-                    .slice()
-                    .sort((a: any, b: any) => Number(b.stock || 0) - Number(a.stock || 0))
-                    .slice(0, 3)
-                    .map((w: any) => `${w.name || w.code}:${Number(w.stock || 0)}`)
-                    .join(" | ")
-                : null,
-            }
-          : null;
-
-        const alts = (session.productAlternatives || []).slice(0, 3).map((a: any) => ({
-          ref: a.ref,
-          brand: a.brandName || a.brandCode,
-          price: a.price,
-          avail: a.isAvailable,
-        }));
-
-        app.log.info(
-          {
-            vehicleId,
-            familyId,
-            bestScore: best.score,
-            got: products.length,
-            primary: primary.length,
-            winner,
-            alts,
-          },
-          "Products selected (decision cached)"
-        );
-      } else {
-        session.selectedProduct = null;
-        session.productAlternatives = [];
-        app.log.info({ vehicleId, familyId }, "Products selection skipped (missing vehicleId/familyId)");
-      }
-    } catch (e: any) {
-      app.log.error({ err: e?.message || e, stack: e?.stack }, "Products selection failed");
-      session.selectedProduct = null;
-      session.productAlternatives = [];
-    }
+    const productSelection = await selectProductForSession(session, userContent, app);
+    session.selectedProduct = productSelection.selectedProduct;
+    session.productAlternatives = productSelection.alternatives;
 
     // guarda user msg
     session.messages.push({ role: "user", content: userContent, ts: Date.now() });
@@ -466,27 +543,8 @@ export async function webhook(app: FastifyInstance) {
         .map((m) => ({ role: m.role, content: m.content }));
 
       const best = session.partMatches?.matches?.[0];
-
       const hasSelected = Boolean(session.selectedProduct);
-
-      const decision: DecisionContext = {
-        part: best ? { id: best.id, canonical_name: best.canonical_name, score: best.score } : undefined,
-        vehicle: session.vehicle
-          ? {
-              plate: session.vehicle.plate,
-              brand: session.vehicle.brand,
-              model: session.vehicle.model,
-              fuel: session.vehicle.fuel,
-              vin: session.vehicle.vin,
-            }
-          : undefined,
-
-        selectedProduct: session.selectedProduct ?? undefined,
-        alternatives: session.productAlternatives?.length ? session.productAlternatives : undefined,
-
-        // ✅ CLAVE: si ya tengo producto, NO pregunto “para confirmar”
-        askOneClarifyingQuestion: !hasSelected && Boolean(best && best.score < MATCH_THRESHOLD),
-      };
+      const decision = buildDecisionContext(session);
 
       app.log.info(
         {
